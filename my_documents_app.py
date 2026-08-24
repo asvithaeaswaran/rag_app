@@ -39,6 +39,7 @@ os.makedirs(INDEX_FOLDER, exist_ok=True)
 EMBEDDING_DIM = 1536
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+print("OPENAI KEY FOUND:", bool(OPENAI_API_KEY))
 
 print("[My Documents] Using OpenAI text-embedding-3-small for embeddings.")
 
