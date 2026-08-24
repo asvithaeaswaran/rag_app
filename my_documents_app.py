@@ -1,904 +1,1868 @@
-"""
-========================================================================================
-📂 My Documents — Simple RAG Q&A System (No LangChain, Pure Python)
-========================================================================================
-Built with:
-1. Text Extraction: PyPDF & python-docx
-2. Text Chunking: Pure Python Recursive Splitter
-3. Embedding Model: sentence-transformers/all-MiniLM-L6-v2
-4. Vector Database: FAISS (Facebook AI Similarity Search)
-5. LLMs: Google Gemini, Ollama Local, Groq, OpenAI (via direct API requests)
-========================================================================================
-"""
-
 import os
-import re
 import json
 import shutil
 import numpy as np
-from pathlib import Path
-from flask import Flask, request, jsonify, render_template_string
-from dotenv import load_dotenv
-
-# Core dependencies
+import requests
 import pypdf
 import docx
 import faiss
-from sentence_transformers import SentenceTransformer
-import requests
 
-# Load .env variables
+from flask import Flask, request, jsonify, render_template_string
+from dotenv import load_dotenv
+
 load_dotenv()
 
 app = Flask(__name__)
 
-# Configure upload and vector store folders (works on both local & Render cloud)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'my_documents_files')
-app.config['INDEX_FOLDER'] = os.path.join(BASE_DIR, 'my_documents_faiss')
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs(app.config['INDEX_FOLDER'], exist_ok=True)
 
-# -----------------------------------------------------------------------------
-# 1. INITIALIZE EMBEDDING MODEL (all-MiniLM-L6-v2)
-# -----------------------------------------------------------------------------
-print("[My Documents] Loading embedding model: sentence-transformers/all-MiniLM-L6-v2...")
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-EMBEDDING_DIM = 384  # 384-dimensional dense vector embeddings
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "my_documents_files")
+INDEX_FOLDER = os.path.join(BASE_DIR, "my_documents_faiss")
 
-# In-memory document & chunk registry
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(INDEX_FOLDER, exist_ok=True)
+
+FAISS_INDEX_PATH = os.path.join(INDEX_FOLDER, "my_documents.index")
+METADATA_PATH = os.path.join(INDEX_FOLDER, "metadata.json")
+
+# OpenAI text-embedding-3-small = 1536 dimensions
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIM = 1536
+
 chunks_registry = []
 uploaded_documents = []
 
 
-# -----------------------------------------------------------------------------
-# 2. DOCUMENT PARSERS & TEXT EXTRACTORS (Pure Python)
-# -----------------------------------------------------------------------------
+# ============================================================
+# OPENAI EMBEDDINGS
+# ============================================================
 
-def extract_text(file_path: str, filename: str) -> list[dict]:
+def get_openai_key():
+    key = os.environ.get("OPENAI_API_KEY")
+
+    if not key:
+        return None
+
+    return key.strip()
+
+
+def create_embeddings(texts):
     """
-    Extracts text page by page from PDF, DOCX, TXT, MD, or CSV files.
-    Returns: list of {'text': str, 'page': int}
+    Create embeddings using OpenAI API.
+    No sentence-transformers is used.
     """
-    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else 'txt'
+
+    api_key = get_openai_key()
+
+    if not api_key:
+        raise Exception("OPENAI_API_KEY is not configured in Render Environment Variables.")
+
+    url = "https://api.openai.com/v1/embeddings"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": EMBEDDING_MODEL,
+        "input": texts
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=120
+    )
+
+    if response.status_code != 200:
+        raise Exception(
+            f"OpenAI Embeddings API error {response.status_code}: {response.text}"
+        )
+
+    data = response.json()
+
+    embeddings = [
+        item["embedding"]
+        for item in data["data"]
+    ]
+
+    return np.array(embeddings, dtype=np.float32)
+
+
+# ============================================================
+# FAISS
+# ============================================================
+
+def create_empty_index():
+    return faiss.IndexFlatL2(EMBEDDING_DIM)
+
+
+def load_faiss_index():
+
+    global chunks_registry
+    global uploaded_documents
+
+    if (
+        os.path.exists(FAISS_INDEX_PATH)
+        and os.path.exists(METADATA_PATH)
+    ):
+        try:
+            index = faiss.read_index(FAISS_INDEX_PATH)
+
+            with open(METADATA_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            chunks_registry = data.get("chunks", [])
+            uploaded_documents = data.get("documents", [])
+
+            print(
+                f"[My Documents] Loaded FAISS index with "
+                f"{index.ntotal} vectors."
+            )
+
+            return index
+
+        except Exception as e:
+            print("Could not load existing FAISS index:", e)
+
+    print("[My Documents] Creating new FAISS index.")
+
+    return create_empty_index()
+
+
+faiss_index = load_faiss_index()
+
+
+def save_faiss_index():
+
+    faiss.write_index(
+        faiss_index,
+        FAISS_INDEX_PATH
+    )
+
+    with open(METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "chunks": chunks_registry,
+                "documents": uploaded_documents
+            },
+            f,
+            indent=2
+        )
+
+
+# ============================================================
+# DOCUMENT EXTRACTION
+# ============================================================
+
+def extract_text(file_path, filename):
+
+    extension = ""
+
+    if "." in filename:
+        extension = filename.rsplit(".", 1)[-1].lower()
+
     pages = []
 
-    # A) PDF Files
-    if ext == 'pdf':
+    # ---------------- PDF ----------------
+
+    if extension == "pdf":
+
         try:
+
             reader = pypdf.PdfReader(file_path)
-            for i, page in enumerate(reader.pages):
-                txt = (page.extract_text() or "").strip()
-                if txt:
-                    pages.append({'text': txt, 'page': i + 1})
-        except Exception as e:
-            print(f"Error reading PDF {filename}: {e}")
 
-    # B) Word Documents (.docx)
-    elif ext in ['docx', 'doc']:
+            for page_number, page in enumerate(
+                reader.pages,
+                start=1
+            ):
+
+                text = page.extract_text() or ""
+                text = text.strip()
+
+                if text:
+                    pages.append(
+                        {
+                            "text": text,
+                            "page": page_number
+                        }
+                    )
+
+        except Exception as e:
+
+            raise Exception(
+                f"Could not read PDF: {str(e)}"
+            )
+
+    # ---------------- DOCX ----------------
+
+    elif extension == "docx":
+
         try:
-            doc = docx.Document(file_path)
-            paras = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
-            for table in doc.tables:
-                for row in table.rows:
-                    row_txt = " | ".join(c.text.strip() for c in row.cells if c.text.strip())
-                    if row_txt:
-                        paras.append(row_txt)
-            full_text = "\n\n".join(paras)
-            if full_text.strip():
-                pages.append({'text': full_text, 'page': 1})
-        except Exception as e:
-            print(f"Error reading DOCX {filename}: {e}")
 
-    # C) Plain Text / Markdown / CSV / JSON
+            document = docx.Document(file_path)
+
+            paragraphs = []
+
+            for paragraph in document.paragraphs:
+
+                text = paragraph.text.strip()
+
+                if text:
+                    paragraphs.append(text)
+
+            for table in document.tables:
+
+                for row in table.rows:
+
+                    cells = []
+
+                    for cell in row.cells:
+
+                        cell_text = cell.text.strip()
+
+                        if cell_text:
+                            cells.append(cell_text)
+
+                    if cells:
+                        paragraphs.append(
+                            " | ".join(cells)
+                        )
+
+            full_text = "\n\n".join(paragraphs)
+
+            if full_text.strip():
+
+                pages.append(
+                    {
+                        "text": full_text,
+                        "page": 1
+                    }
+                )
+
+        except Exception as e:
+
+            raise Exception(
+                f"Could not read DOCX: {str(e)}"
+            )
+
+    # ---------------- TXT / CSV / MD ----------------
+
     else:
-        for enc in ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']:
-            try:
-                with open(file_path, 'r', encoding=enc) as f:
-                    content = f.read().strip()
-                    if content:
-                        pages.append({'text': content, 'page': 1})
-                break
-            except Exception:
-                continue
+
+        try:
+
+            with open(
+                file_path,
+                "r",
+                encoding="utf-8",
+                errors="replace"
+            ) as f:
+
+                text = f.read().strip()
+
+            if text:
+
+                pages.append(
+                    {
+                        "text": text,
+                        "page": 1
+                    }
+                )
+
+        except Exception as e:
+
+            raise Exception(
+                f"Could not read text file: {str(e)}"
+            )
 
     return pages
 
 
-# -----------------------------------------------------------------------------
-# 3. SIMPLE TEXT CHUNKER (Pure Python)
-# -----------------------------------------------------------------------------
+# ============================================================
+# TEXT CHUNKING
+# ============================================================
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 80) -> list[str]:
-    """
-    Splits text into overlapping chunks on sentence or paragraph boundaries.
-    """
+def chunk_text(
+    text,
+    chunk_size=800,
+    overlap=100
+):
+
+    text = text.strip()
+
+    if not text:
+        return []
+
     if len(text) <= chunk_size:
         return [text]
 
     chunks = []
+
     start = 0
+
     while start < len(text):
-        end = start + chunk_size
-        
-        # Try to find a natural break near the end (newline, period, or space)
+
+        end = min(
+            start + chunk_size,
+            len(text)
+        )
+
         if end < len(text):
-            break_pos = text.rfind('\n', start, end)
-            if break_pos == -1 or break_pos < start + (chunk_size // 2):
-                break_pos = text.rfind('. ', start, end)
-            if break_pos == -1 or break_pos < start + (chunk_size // 2):
-                break_pos = text.rfind(' ', start, end)
-            if break_pos != -1 and break_pos > start:
-                end = break_pos + 1
+
+            break_position = text.rfind(
+                "\n",
+                start,
+                end
+            )
+
+            if (
+                break_position == -1
+                or break_position < start + chunk_size // 2
+            ):
+
+                break_position = text.rfind(
+                    ". ",
+                    start,
+                    end
+                )
+
+            if (
+                break_position == -1
+                or break_position < start + chunk_size // 2
+            ):
+
+                break_position = text.rfind(
+                    " ",
+                    start,
+                    end
+                )
+
+            if break_position > start:
+                end = break_position + 1
 
         chunk = text[start:end].strip()
+
         if chunk:
             chunks.append(chunk)
 
-        start = end - overlap
-        if start >= len(text) - overlap:
+        if end >= len(text):
             break
+
+        start = max(
+            0,
+            end - overlap
+        )
 
     return chunks
 
 
-# -----------------------------------------------------------------------------
-# 4. FAISS VECTOR DATABASE STORAGE
-# -----------------------------------------------------------------------------
+# ============================================================
+# ADD DOCUMENT
+# ============================================================
 
-faiss_index_path = os.path.join(app.config['INDEX_FOLDER'], 'my_documents.index')
-meta_path = os.path.join(app.config['INDEX_FOLDER'], 'metadata.json')
+def add_document_to_faiss(
+    file_path,
+    filename
+):
 
+    global faiss_index
+    global chunks_registry
+    global uploaded_documents
 
-def init_or_load_faiss_index():
-    """Load existing FAISS index from disk or create a fresh IndexFlatL2."""
-    global chunks_registry, uploaded_documents
-    if os.path.exists(faiss_index_path) and os.path.exists(meta_path):
-        try:
-            index = faiss.read_index(faiss_index_path)
-            with open(meta_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                chunks_registry = data.get('chunks', [])
-                uploaded_documents = data.get('documents', [])
-            return index
-        except Exception as e:
-            print(f"Failed to load FAISS index: {e}")
+    pages = extract_text(
+        file_path,
+        filename
+    )
 
-    return faiss.IndexFlatL2(EMBEDDING_DIM)
-
-
-faiss_index = init_or_load_faiss_index()
-
-
-def save_faiss_index():
-    """Persist FAISS index and chunk metadata to disk."""
-    faiss.write_index(faiss_index, faiss_index_path)
-    with open(meta_path, 'w', encoding='utf-8') as f:
-        json.dump({
-            'chunks': chunks_registry,
-            'documents': uploaded_documents
-        }, f, indent=2)
-
-
-def add_document_to_faiss(file_path: str, filename: str) -> int:
-    """
-    Parses document, splits it into chunks, generates embeddings, and saves into FAISS.
-    Returns: number of chunks added
-    """
-    global faiss_index, chunks_registry, uploaded_documents
-
-    pages = extract_text(file_path, filename)
     if not pages:
-        return 0
+        raise Exception(
+            "No readable text was found in the document."
+        )
 
     new_chunks = []
-    for p in pages:
-        text_splits = chunk_text(p['text'], chunk_size=500, overlap=80)
-        for idx, chunk_str in enumerate(text_splits):
-            new_chunks.append({
-                'filename': filename,
-                'page': p['page'],
-                'chunk_index': idx,
-                'text': chunk_str
-            })
+
+    for page in pages:
+
+        pieces = chunk_text(
+            page["text"],
+            chunk_size=800,
+            overlap=100
+        )
+
+        for chunk_number, text in enumerate(
+            pieces
+        ):
+
+            new_chunks.append(
+                {
+                    "filename": filename,
+                    "page": page["page"],
+                    "chunk_index": chunk_number,
+                    "text": text
+                }
+            )
 
     if not new_chunks:
-        return 0
+        raise Exception(
+            "No text chunks were created."
+        )
 
-    # 1. Compute Embeddings with all-MiniLM-L6-v2
-    texts_to_embed = [c['text'] for c in new_chunks]
-    embeddings = embedding_model.encode(texts_to_embed, normalize_embeddings=True)
-    embeddings = np.array(embeddings, dtype=np.float32)
+    texts = [
+        item["text"]
+        for item in new_chunks
+    ]
 
-    # 2. Add to FAISS Vector Index
-    faiss_index.add(embeddings)
+    print(
+        f"[My Documents] Creating embeddings "
+        f"for {len(texts)} chunks..."
+    )
+
+    embeddings = create_embeddings(texts)
+
+    # If same document already exists,
+    # rebuild index after removing old version.
+    chunks_registry = [
+        item
+        for item in chunks_registry
+        if item["filename"] != filename
+    ]
+
+    uploaded_documents = [
+        item
+        for item in uploaded_documents
+        if item["filename"] != filename
+    ]
+
     chunks_registry.extend(new_chunks)
 
-    # 3. Record in uploaded documents registry
-    doc_info = {
-        'filename': filename,
-        'chunks_count': len(new_chunks),
-        'file_size': os.path.getsize(file_path)
-    }
-    uploaded_documents = [d for d in uploaded_documents if d['filename'] != filename]
-    uploaded_documents.append(doc_info)
+    uploaded_documents.append(
+        {
+            "filename": filename,
+            "chunks_count": len(new_chunks),
+            "file_size": os.path.getsize(file_path)
+        }
+    )
+
+    rebuild_faiss_index()
 
     save_faiss_index()
+
     return len(new_chunks)
 
 
-def search_faiss(query: str, top_k: int = 3) -> list[dict]:
-    """
-    Embeds user question and retrieves top-k closest chunks from FAISS.
-    """
-    if faiss_index.ntotal == 0 or len(chunks_registry) == 0:
+# ============================================================
+# REBUILD FAISS INDEX
+# ============================================================
+
+def rebuild_faiss_index():
+
+    global faiss_index
+
+    faiss_index = create_empty_index()
+
+    if not chunks_registry:
+        return
+
+    texts = [
+        item["text"]
+        for item in chunks_registry
+    ]
+
+    embeddings = create_embeddings(texts)
+
+    faiss_index.add(embeddings)
+
+    print(
+        f"[My Documents] FAISS rebuilt with "
+        f"{faiss_index.ntotal} vectors."
+    )
+
+
+# ============================================================
+# SEARCH
+# ============================================================
+
+def search_faiss(
+    query,
+    top_k=3
+):
+
+    if (
+        faiss_index.ntotal == 0
+        or not chunks_registry
+    ):
         return []
 
-    query_vec = embedding_model.encode([query], normalize_embeddings=True)
-    query_vec = np.array(query_vec, dtype=np.float32)
+    query_embedding = create_embeddings(
+        [query]
+    )
 
-    k = min(top_k, faiss_index.ntotal)
-    distances, indices = faiss_index.search(query_vec, k)
+    k = min(
+        top_k,
+        faiss_index.ntotal
+    )
+
+    distances, indices = faiss_index.search(
+        query_embedding,
+        k
+    )
 
     results = []
-    for rank, (idx, dist) in enumerate(zip(indices[0], distances[0]), 1):
-        if idx < len(chunks_registry):
-            chunk = chunks_registry[idx]
-            results.append({
-                'rank': rank,
-                'filename': chunk['filename'],
-                'page': chunk['page'],
-                'text': chunk['text'],
-                'score': round(float(dist), 4),
-                'snippet': chunk['text'][:250] + ('...' if len(chunk['text']) > 250 else '')
-            })
+
+    for rank, (index, distance) in enumerate(
+        zip(indices[0], distances[0]),
+        start=1
+    ):
+
+        if index < 0:
+            continue
+
+        if index >= len(chunks_registry):
+            continue
+
+        chunk = chunks_registry[index]
+
+        results.append(
+            {
+                "rank": rank,
+                "filename": chunk["filename"],
+                "page": chunk["page"],
+                "text": chunk["text"],
+                "score": round(
+                    float(distance),
+                    4
+                ),
+                "snippet": (
+                    chunk["text"][:300]
+                    + (
+                        "..."
+                        if len(chunk["text"]) > 300
+                        else ""
+                    )
+                )
+            }
+        )
 
     return results
 
 
-# -----------------------------------------------------------------------------
-# 5. DIRECT LLM CALLS (Google Gemini, Ollama, Groq, OpenAI)
-# -----------------------------------------------------------------------------
+# ============================================================
+# LLM
+# ============================================================
 
-def sanitize_key(val):
-    """Clean API keys removing all whitespace, newlines, and carriage returns."""
-    if not val:
-        return None
-    cleaned = str(val).strip().replace('\r', '').replace('\n', '').replace('\t', '').strip()
-    return cleaned if cleaned else None
+def call_llm(
+    question,
+    context,
+    provider="gemini",
+    api_key=None
+):
 
-
-def call_llm(user_question: str, context_text: str, provider: str = "auto", api_key: str = None) -> str:
-    """
-    Calls the LLM directly with the RAG prompt without external framework wrappers.
-    """
-    system_instruction = (
-        "You are 'My Documents AI', a helpful and precise assistant. "
-        "Answer the user's question accurately using ONLY the provided document excerpts below. "
-        "If the information is not contained in the excerpts, clearly say that the uploaded documents do not have this information. "
-        "Format your answer cleanly with bullet points and bold key terms."
+    system_prompt = (
+        "You are My Documents AI. "
+        "Answer the user's question using only the "
+        "provided document excerpts. "
+        "If the answer is not present in the documents, "
+        "say that the uploaded documents do not contain "
+        "that information. "
+        "Give a clear and concise answer."
     )
 
-    full_prompt = (
-        f"DOCUMENT EXCERPTS:\n{context_text}\n\n"
-        f"USER QUESTION: {user_question}\n\n"
-        "Please provide a complete and accurate answer based on the document excerpts above."
+    user_prompt = (
+        "DOCUMENT EXCERPTS:\n\n"
+        + context
+        + "\n\nUSER QUESTION:\n"
+        + question
     )
 
-    # Sanitize and resolve keys
-    cleaned_user_key = sanitize_key(api_key)
-    gemini_key = sanitize_key(cleaned_user_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-    groq_openai_key = sanitize_key(cleaned_user_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("GROQ_API_KEY"))
-    ollama_url = sanitize_key(os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")) or "http://localhost:11434"
+    # ========================================================
+    # GEMINI
+    # ========================================================
 
-    # A) Google Gemini Direct API
-    if (provider == "gemini" or (not provider and gemini_key and gemini_key.startswith("AIza"))) and gemini_key:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}"
-            payload = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": f"System: {system_instruction}\n\n{full_prompt}"}
-                        ]
+    if provider == "gemini":
+
+        gemini_key = (
+            api_key
+            or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+        )
+
+        if gemini_key:
+
+            try:
+
+                url = (
+                    "https://generativelanguage.googleapis.com/"
+                    "v1beta/models/gemini-2.0-flash:"
+                    "generateContent"
+                )
+
+                url += "?key=" + gemini_key.strip()
+
+                payload = {
+                    "contents": [
+                        {
+                            "parts": [
+                                {
+                                    "text":
+                                    system_prompt
+                                    + "\n\n"
+                                    + user_prompt
+                                }
+                            ]
+                        }
+                    ],
+                    "generationConfig": {
+                        "temperature": 0.3,
+                        "maxOutputTokens": 2048
                     }
-                ],
-                "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
-            }
-            res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
-            if res.status_code == 200:
-                data = res.json()
-                if 'candidates' in data and data['candidates']:
-                    return data['candidates'][0]['content']['parts'][0]['text']
-            else:
-                print(f"Gemini API error: {res.status_code} - {res.text}")
-        except Exception as e:
-            print(f"Gemini request exception: {e}")
+                }
 
-    # B) Ollama Local Model Direct API
-    if provider == "ollama" or (not provider and not gemini_key and not groq_openai_key):
-        try:
-            url = f"{ollama_url.rstrip('/')}/api/generate"
-            payload = {
-                "model": os.environ.get("OLLAMA_MODEL", "llama3"),
-                "prompt": f"{system_instruction}\n\n{full_prompt}",
-                "stream": False,
-                "options": {"temperature": 0.3}
-            }
-            res = requests.post(url, json=payload, timeout=30)
-            if res.status_code == 200:
-                return res.json().get('response', '')
-        except Exception as e:
-            print(f"Ollama local request error: {e}")
+                response = requests.post(
+                    url,
+                    json=payload,
+                    timeout=60
+                )
 
-    # C) Groq / OpenAI Direct API
-    if groq_openai_key:
-        try:
-            base_url = "https://api.groq.com/openai/v1/chat/completions" if groq_openai_key.startswith("gsk_") else "https://api.openai.com/v1/chat/completions"
-            model = os.environ.get("OPENAI_MODEL", "openai/gpt-oss-120b" if groq_openai_key.startswith("gsk_") else "gpt-4o-mini")
-            
-            clean_auth_header = f"Bearer {groq_openai_key}".strip()
-            headers = {
-                "Authorization": clean_auth_header,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": full_prompt}
-                ],
-                "temperature": 0.3
-            }
-            res = requests.post(base_url, json=payload, headers=headers, timeout=30)
-            if res.status_code == 200:
-                return res.json()['choices'][0]['message']['content']
-            else:
-                print(f"Groq/OpenAI API error: {res.status_code} - {res.text}")
-        except Exception as e:
-            print(f"Groq/OpenAI error: {e}")
+                if response.status_code == 200:
+
+                    data = response.json()
+
+                    candidates = data.get(
+                        "candidates",
+                        []
+                    )
+
+                    if candidates:
+
+                        parts = (
+                            candidates[0]
+                            .get("content", {})
+                            .get("parts", [])
+                        )
+
+                        if parts:
+
+                            return parts[0].get(
+                                "text",
+                                ""
+                            )
+
+                print(
+                    "Gemini error:",
+                    response.status_code,
+                    response.text
+                )
+
+            except Exception as e:
+
+                print(
+                    "Gemini request error:",
+                    e
+                )
+
+    # ========================================================
+    # OPENAI
+    # ========================================================
+
+    if provider == "openai":
+
+        openai_key = (
+            api_key
+            or os.environ.get("OPENAI_API_KEY")
+        )
+
+        if openai_key:
+
+            try:
+
+                response = requests.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization":
+                        "Bearer " + openai_key.strip(),
+                        "Content-Type":
+                        "application/json"
+                    },
+                    json={
+                        "model":
+                        os.environ.get(
+                            "OPENAI_MODEL",
+                            "gpt-4o-mini"
+                        ),
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content":
+                                system_prompt
+                            },
+                            {
+                                "role": "user",
+                                "content":
+                                user_prompt
+                            }
+                        ],
+                        "temperature": 0.3
+                    },
+                    timeout=60
+                )
+
+                if response.status_code == 200:
+
+                    data = response.json()
+
+                    return (
+                        data["choices"][0]
+                        ["message"]["content"]
+                    )
+
+                print(
+                    "OpenAI error:",
+                    response.status_code,
+                    response.text
+                )
+
+            except Exception as e:
+
+                print(
+                    "OpenAI request error:",
+                    e
+                )
 
     return None
 
 
-# -----------------------------------------------------------------------------
-# 6. FLASK WEB ROUTES & BEAUTIFUL UI
-# -----------------------------------------------------------------------------
+# ============================================================
+# HTML
+# ============================================================
 
-UI_TEMPLATE = """
+HTML = """
 <!DOCTYPE html>
-<html lang="en">
+
+<html>
+
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>My Documents — Simple RAG System</title>
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Marked.js Markdown Renderer -->
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <!-- FontAwesome -->
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 
-    <style>
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 9999px; }
-        .markdown-body p { margin-bottom: 0.75rem; }
-        .markdown-body ul { list-style-type: disc; padding-left: 1.25rem; margin-bottom: 0.75rem; }
-        .markdown-body pre { background: #0f172a; padding: 0.75rem; border-radius: 0.5rem; overflow-x: auto; margin: 0.5rem 0; }
-        .markdown-body code { background: rgba(255,255,255,0.1); padding: 0.1rem 0.3rem; border-radius: 0.2rem; font-size: 0.9em; }
-    </style>
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<title>My Documents AI</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+<style>
+
+body {
+    font-family: Arial, sans-serif;
+}
+
+::-webkit-scrollbar {
+    width: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #475569;
+    border-radius: 10px;
+}
+
+</style>
+
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans">
-    
-    <!-- Top Header -->
-    <header class="bg-slate-900 border-b border-slate-800 px-6 py-4 flex items-center justify-between sticky top-0 z-20 shadow-md">
-        <div class="flex items-center gap-3">
-            <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 via-indigo-600 to-violet-600 flex items-center justify-center text-white text-lg shadow-lg">
-                <i class="fa-solid fa-folder-tree"></i>
-            </div>
-            <div>
-                <h1 class="text-lg font-bold text-white tracking-wide flex items-center gap-2">
-                    <span>My Documents</span>
-                    <span class="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20 font-medium">RAG Q&A</span>
-                </h1>
-                <p class="text-xs text-slate-400">Pure Python RAG &bull; all-MiniLM-L6-v2 &bull; FAISS Vector Search</p>
-            </div>
-        </div>
-        <div class="flex items-center gap-3">
-            <button id="settingsBtn" class="text-xs px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition flex items-center gap-1.5">
-                <i class="fa-solid fa-sliders text-indigo-400"></i>
-                <span>LLM Settings</span>
-            </button>
-        </div>
-    </header>
 
-    <!-- Main Container -->
-    <div class="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 grid grid-cols-1 md:grid-cols-3 gap-6">
-        
-        <!-- Left Panel: My Documents (Upload & Knowledge Base) -->
-        <div class="bg-slate-900 rounded-2xl border border-slate-800 p-5 flex flex-col h-[78vh] shadow-xl">
-            <div class="flex items-center justify-between mb-3">
-                <h2 class="text-sm font-bold text-white flex items-center gap-2">
-                    <i class="fa-solid fa-book-bookmark text-blue-400"></i>
-                    <span>Knowledge Base</span>
-                </h2>
-                <span id="docBadge" class="text-[11px] px-2 py-0.5 rounded-full bg-blue-950 text-blue-300 font-semibold border border-blue-800/50">0 files</span>
-            </div>
+<body class="bg-slate-950 text-white min-h-screen">
 
-            <!-- Upload Dropzone -->
-            <div id="dropzone" class="border-2 border-dashed border-slate-700 hover:border-blue-500 bg-slate-950/60 rounded-xl p-5 text-center cursor-pointer transition mb-4">
-                <input type="file" id="fileInput" multiple accept=".pdf,.docx,.txt,.csv,.md,.json" class="hidden">
-                <div class="w-10 h-10 rounded-full bg-blue-500/10 text-blue-400 flex items-center justify-center mx-auto mb-2 text-lg">
-                    <i class="fa-solid fa-cloud-arrow-up"></i>
-                </div>
-                <div class="text-xs font-semibold text-white">Click or Drop Files to Upload</div>
-                <p class="text-[10px] text-slate-400 mt-0.5">Supports PDF, DOCX, TXT, CSV, MD</p>
-            </div>
+<div class="max-w-7xl mx-auto p-5">
 
-            <!-- Indexing progress indicator -->
-            <div id="uploadingBox" class="hidden p-3 rounded-xl bg-blue-950/60 border border-blue-500/30 text-blue-300 text-xs text-center mb-3">
-                <i class="fa-solid fa-circle-notch fa-spin mr-1.5"></i> Extracting chunks & computing FAISS embeddings...
-            </div>
+<div class="mb-5">
 
-            <!-- List of Documents -->
-            <div class="flex items-center justify-between text-xs text-slate-400 mb-2">
-                <span class="font-medium">Indexed in FAISS</span>
-                <button id="clearAllBtn" class="text-rose-400 hover:text-rose-300 text-[11px] transition">Clear All</button>
-            </div>
-            <div id="documentsList" class="flex-1 overflow-y-auto space-y-2 pr-1 text-xs">
-                <div class="text-center py-12 text-slate-500">No documents in knowledge base yet.</div>
-            </div>
-        </div>
+<h1 class="text-2xl font-bold">
+My Documents AI
+</h1>
 
-        <!-- Right Panel: Q&A Chat Area -->
-        <div class="md:col-span-2 bg-slate-900 rounded-2xl border border-slate-800 p-5 flex flex-col h-[78vh] shadow-xl">
-            <!-- Messages Stream -->
-            <div id="chatMessages" class="flex-1 overflow-y-auto space-y-4 pr-2 mb-4">
-                <div id="welcomeMessage" class="text-center py-20 px-4">
-                    <div class="w-14 h-14 rounded-2xl bg-gradient-to-tr from-blue-500 to-indigo-600 text-white flex items-center justify-center text-2xl mx-auto mb-3 shadow-lg">
-                        <i class="fa-solid fa-magnifying-glass-chart"></i>
-                    </div>
-                    <h3 class="text-lg font-bold text-white mb-1">Ask questions on your documents</h3>
-                    <p class="text-xs text-slate-400 max-w-md mx-auto">Upload documents on the left. The system will retrieve relevant chunks using FAISS and answer your questions with precise citations.</p>
-                </div>
-            </div>
+<p class="text-slate-400 text-sm">
+Simple RAG Q&A using OpenAI Embeddings and FAISS
+</p>
 
-            <!-- Searching indicator -->
-            <div id="searchingIndicator" class="hidden text-xs text-blue-400 mb-2 flex items-center gap-2">
-                <i class="fa-solid fa-circle-notch fa-spin"></i>
-                <span>Retrieving relevant chunks from FAISS vector store...</span>
-            </div>
+</div>
 
-            <!-- Input Form -->
-            <form id="questionForm" class="flex gap-2">
-                <input
-                    type="text"
-                    id="questionInput"
-                    placeholder="Ask a question based on your uploaded documents..."
-                    class="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
-                    required
-                />
-                <button
-                    type="submit"
-                    id="sendBtn"
-                    class="px-5 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs shadow-md transition flex items-center gap-2"
-                >
-                    <span>Ask AI</span>
-                    <i class="fa-solid fa-arrow-up text-xs"></i>
-                </button>
-            </form>
-        </div>
-    </div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-5">
 
-    <!-- Settings Modal -->
-    <div id="settingsModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5 shadow-2xl space-y-4 text-xs">
-            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
-                <h3 class="text-sm font-bold text-white flex items-center gap-2">
-                    <i class="fa-solid fa-sliders text-blue-400"></i>
-                    <span>Model Settings</span>
-                </h3>
-                <button id="closeSettingsBtn" class="text-slate-400 hover:text-white">
-                    <i class="fa-solid fa-xmark text-base"></i>
-                </button>
-            </div>
+<!-- DOCUMENTS -->
 
-            <div>
-                <label class="block font-medium text-slate-300 mb-1">LLM Provider</label>
-                <select id="providerSelect" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white">
-                    <option value="gemini">Google Gemini (Free API Key)</option>
-                    <option value="ollama">Ollama Local (http://localhost:11434)</option>
-                    <option value="groq">Groq Live AI (Ultra Fast)</option>
-                    <option value="openai">OpenAI (GPT-4o-mini)</option>
-                </select>
-            </div>
+<div class="bg-slate-900 border border-slate-800 rounded-xl p-5">
 
-            <div>
-                <label class="block font-medium text-slate-300 mb-1">API Key (Gemini / Groq / OpenAI)</label>
-                <input type="password" id="apiKeyInput" placeholder="Paste your API key (e.g. AIza... or gsk_...)" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white">
-            </div>
+<h2 class="font-bold mb-4">
+Uploaded Documents
+</h2>
 
-            <div class="p-3 rounded-lg bg-slate-950/80 border border-slate-800 text-[11px] text-slate-400 space-y-1">
-                <div><strong>Embedding Model:</strong> all-MiniLM-L6-v2 (384d)</div>
-                <div><strong>Vector Database:</strong> FAISS FlatL2 (Local)</div>
-            </div>
+<div
+id="dropzone"
+class="border-2 border-dashed border-slate-700 rounded-xl p-8 text-center cursor-pointer hover:border-blue-500"
+>
 
-            <div class="flex justify-end gap-2 pt-2 border-t border-slate-800">
-                <button id="saveSettingsBtn" class="px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold">Save Settings</button>
-            </div>
-        </div>
-    </div>
+<input
+type="file"
+id="fileInput"
+multiple
+accept=".pdf,.docx,.txt,.csv,.md"
+style="display:none;"
+>
 
-    <!-- Frontend Script -->
-    <script>
-        const dropzone = document.getElementById('dropzone');
-        const fileInput = document.getElementById('fileInput');
-        const uploadingBox = document.getElementById('uploadingBox');
-        const documentsList = document.getElementById('documentsList');
-        const docBadge = document.getElementById('docBadge');
-        const clearAllBtn = document.getElementById('clearAllBtn');
-        const chatMessages = document.getElementById('chatMessages');
-        const welcomeMessage = document.getElementById('welcomeMessage');
-        const questionForm = document.getElementById('questionForm');
-        const questionInput = document.getElementById('questionInput');
-        const searchingIndicator = document.getElementById('searchingIndicator');
-        const sendBtn = document.getElementById('sendBtn');
-        const settingsModal = document.getElementById('settingsModal');
-        const settingsBtn = document.getElementById('settingsBtn');
-        const closeSettingsBtn = document.getElementById('closeSettingsBtn');
-        const saveSettingsBtn = document.getElementById('saveSettingsBtn');
-        const providerSelect = document.getElementById('providerSelect');
-        const apiKeyInput = document.getElementById('apiKeyInput');
+<div class="text-3xl mb-2">
+📁
+</div>
 
-        let currentApiKey = localStorage.getItem('my_doc_api_key') || '';
-        let currentProvider = localStorage.getItem('my_doc_provider') || 'gemini';
+<div class="font-semibold">
+Upload Documents
+</div>
 
-        providerSelect.value = currentProvider;
-        apiKeyInput.value = currentApiKey;
+<div class="text-xs text-slate-400 mt-2">
+PDF, DOCX, TXT, CSV or MD
+</div>
 
-        // Settings Modal
-        settingsBtn.addEventListener('click', () => settingsModal.classList.remove('hidden'));
-        closeSettingsBtn.addEventListener('click', () => settingsModal.classList.add('hidden'));
-        saveSettingsBtn.addEventListener('click', () => {
-            currentApiKey = apiKeyInput.value.trim();
-            currentProvider = providerSelect.value;
-            localStorage.setItem('my_doc_api_key', currentApiKey);
-            localStorage.setItem('my_doc_provider', currentProvider);
-            settingsModal.classList.add('hidden');
-            alert('Settings saved!');
-        });
+</div>
 
-        // Dropzone & File Selection
-        // Dropzone & File Selection
+<div
+id="uploadingBox"
+class="hidden mt-3 p-3 bg-blue-950 rounded-lg text-sm"
+>
+Uploading and creating embeddings...
+</div>
+
+<div class="flex justify-between mt-5 mb-2">
+
+<span class="text-sm text-slate-400">
+Documents
+</span>
+
+<button
+id="clearAllBtn"
+class="text-xs text-red-400"
+>
+Clear All
+</button>
+
+</div>
+
+<div
+id="documentsList"
+class="space-y-2"
+>
+</div>
+
+</div>
+
+
+<!-- CHAT -->
+
+<div class="md:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-5 flex flex-col min-h-[700px]">
+
+<div
+id="chatMessages"
+class="flex-1 overflow-y-auto space-y-4 mb-4"
+>
+
+<div
+id="welcome"
+class="text-center text-slate-400 py-20"
+>
+
+<div class="text-4xl mb-3">
+🤖
+</div>
+
+<h2 class="text-white font-bold text-lg">
+Ask questions about your documents
+</h2>
+
+<p class="text-sm mt-2">
+Upload a document and then ask a question.
+</p>
+
+</div>
+
+</div>
+
+
+<div class="flex gap-2">
+
+<select
+id="providerSelect"
+class="bg-slate-950 border border-slate-700 rounded-lg px-3 text-sm"
+>
+
+<option value="gemini">
+Gemini
+</option>
+
+<option value="openai">
+OpenAI
+</option>
+
+</select>
+
+<input
+id="questionInput"
+class="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-sm"
+placeholder="Ask a question..."
+>
+
+<button
+id="askBtn"
+class="bg-blue-600 hover:bg-blue-500 px-5 rounded-lg"
+>
+Ask
+</button>
+
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+
+<script>
+
+const dropzone =
+document.getElementById("dropzone");
+
+const fileInput =
+document.getElementById("fileInput");
+
+const uploadingBox =
+document.getElementById("uploadingBox");
+
+const documentsList =
+document.getElementById("documentsList");
+
+const clearAllBtn =
+document.getElementById("clearAllBtn");
+
+const chatMessages =
+document.getElementById("chatMessages");
+
+const welcome =
+document.getElementById("welcome");
+
+const questionInput =
+document.getElementById("questionInput");
+
+const askBtn =
+document.getElementById("askBtn");
+
+const providerSelect =
+document.getElementById("providerSelect");
+
+
+/* ==========================================================
+   FILE SELECTION
+   ========================================================== */
+
 dropzone.onclick = function () {
+
     fileInput.click();
+
 };
 
-fileInput.onchange = function (e) {
-    uploadFiles(e.target.files);
+
+fileInput.onchange = function (event) {
+
+    uploadFiles(event.target.files);
+
 };
 
-dropzone.ondragover = function (e) {
-    e.preventDefault();
-    dropzone.classList.add('border-blue-500');
+
+dropzone.ondragover = function (event) {
+
+    event.preventDefault();
+
+    dropzone.classList.add(
+        "border-blue-500"
+    );
+
 };
+
 
 dropzone.ondragleave = function () {
-    dropzone.classList.remove('border-blue-500');
+
+    dropzone.classList.remove(
+        "border-blue-500"
+    );
+
 };
 
-dropzone.ondrop = function (e) {
-    e.preventDefault();
-    dropzone.classList.remove('border-blue-500');
-    uploadFiles(e.dataTransfer.files);
+
+dropzone.ondrop = function (event) {
+
+    event.preventDefault();
+
+    dropzone.classList.remove(
+        "border-blue-500"
+    );
+
+    uploadFiles(
+        event.dataTransfer.files
+    );
+
 };
-        });
 
-        async function uploadFiles(files) {
-            if (!files || files.length === 0) return;
-            uploadingBox.classList.remove('hidden');
 
-            const formData = new FormData();
-            for (let i = 0; i < files.length; i++) {
-                formData.append('files', files[i]);
-            }
+/* ==========================================================
+   UPLOAD
+   ========================================================== */
 
-            try {
-                const res = await fetch('/api/upload', { method: 'POST', body: formData });
-                const data = await res.json();
-                if (res.ok && data.status === 'success') {
-                    fetchDocuments();
-                } else {
-                    alert(data.message || data.error || 'Upload failed');
+async function uploadFiles(files) {
+
+    if (!files || files.length === 0) {
+        return;
+    }
+
+    uploadingBox.classList.remove(
+        "hidden"
+    );
+
+    const formData =
+        new FormData();
+
+    for (
+        let i = 0;
+        i < files.length;
+        i++
+    ) {
+
+        formData.append(
+            "files",
+            files[i]
+        );
+
+    }
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/upload",
+                {
+                    method: "POST",
+                    body: formData
                 }
-            } catch (err) {
-                alert('Upload error: ' + err.message);
-            } finally {
-                uploadingBox.classList.add('hidden');
-                fileInput.value = '';
-            }
+            );
+
+        const data =
+            await response.json();
+
+        if (!response.ok) {
+
+            alert(
+                "Upload failed: "
+                + (
+                    data.error
+                    || "Unknown server error"
+                )
+            );
+
+            return;
         }
 
-        async function fetchDocuments() {
-            try {
-                const res = await fetch('/api/documents');
-                const data = await res.json();
-                renderDocuments(data.documents || []);
-            } catch (err) {
-                console.error(err);
-            }
+        if (
+            data.status === "success"
+        ) {
+
+            alert(
+                data.message
+            );
+
+            fetchDocuments();
+
+        } else {
+
+            alert(
+                "Upload failed: "
+                + data.error
+            );
+
         }
 
-        function renderDocuments(docs) {
-            docBadge.textContent = `${docs.length} file${docs.length === 1 ? '' : 's'}`;
-            documentsList.innerHTML = '';
-            if (docs.length === 0) {
-                documentsList.innerHTML = '<div class="text-center py-12 text-slate-500">No documents in knowledge base yet.</div>';
-                return;
-            }
+    } catch (error) {
 
-            docs.forEach(doc => {
-                const item = document.createElement('div');
-                item.className = 'p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between text-xs group';
-                item.innerHTML = `
-                    <div class="flex items-center gap-2 truncate flex-1">
-                        <i class="fa-solid fa-file-lines text-blue-400 text-sm flex-shrink-0"></i>
-                        <div class="truncate">
-                            <div class="font-semibold text-white truncate">${doc.filename}</div>
-                            <div class="text-[10px] text-slate-400">${doc.chunks_count} chunks in FAISS</div>
-                        </div>
-                    </div>
-                    <div class="flex items-center gap-1.5 flex-shrink-0">
-                        <span class="text-[10px] px-2 py-0.5 rounded-full bg-emerald-950/80 text-emerald-400 border border-emerald-500/20 font-medium">Ready</span>
-                        <button class="delete-single-btn text-slate-500 hover:text-rose-400 p-1 transition" title="Delete document">
-                            <i class="fa-solid fa-trash text-xs"></i>
-                        </button>
-                    </div>
-                `;
+        alert(
+            "Upload error: "
+            + error.message
+        );
 
-                item.querySelector('.delete-single-btn').addEventListener('click', async (e) => {
-                    e.stopPropagation();
-                    if (confirm(`Remove "${doc.filename}" from FAISS index?`)) {
-                        await fetch('/api/delete', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ filename: doc.filename })
-                        });
-                        fetchDocuments();
+    } finally {
+
+        uploadingBox.classList.add(
+            "hidden"
+        );
+
+        fileInput.value = "";
+
+    }
+
+}
+
+
+/* ==========================================================
+   DOCUMENT LIST
+   ========================================================== */
+
+async function fetchDocuments() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/documents"
+            );
+
+        const data =
+            await response.json();
+
+        renderDocuments(
+            data.documents || []
+        );
+
+    } catch (error) {
+
+        console.error(error);
+
+    }
+
+}
+
+
+function renderDocuments(docs) {
+
+    documentsList.innerHTML = "";
+
+    if (docs.length === 0) {
+
+        documentsList.innerHTML =
+            '<div class="text-sm text-slate-500">' +
+            'No documents uploaded yet.' +
+            '</div>';
+
+        return;
+
+    }
+
+    docs.forEach(function(doc) {
+
+        const div =
+            document.createElement("div");
+
+        div.className =
+            "bg-slate-950 border border-slate-800 rounded-lg p-3 flex justify-between items-center";
+
+        div.innerHTML =
+
+            '<div>' +
+
+            '<div class="text-sm font-semibold">' +
+            escapeHtml(doc.filename) +
+            '</div>' +
+
+            '<div class="text-xs text-slate-500">' +
+            doc.chunks_count +
+            ' chunks' +
+            '</div>' +
+
+            '</div>' +
+
+            '<button class="deleteBtn text-red-400 text-xs">' +
+            'Delete' +
+            '</button>';
+
+        div
+            .querySelector(".deleteBtn")
+            .onclick = async function() {
+
+                await fetch(
+                    "/api/delete",
+                    {
+                        method: "POST",
+                        headers: {
+                            "Content-Type":
+                            "application/json"
+                        },
+                        body: JSON.stringify({
+                            filename:
+                            doc.filename
+                        })
                     }
-                });
+                );
 
-                documentsList.appendChild(item);
-            });
-        }
-
-        clearAllBtn.addEventListener('click', async () => {
-            if (confirm('Delete all documents and reset FAISS vector index?')) {
-                await fetch('/api/clear', { method: 'POST' });
                 fetchDocuments();
-                chatMessages.innerHTML = '';
-                chatMessages.appendChild(welcomeMessage);
-            }
-        });
 
-        questionForm.addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const text = questionInput.value.trim();
-            if (!text) return;
+            };
 
-            if (welcomeMessage) welcomeMessage.classList.add('hidden');
-            questionInput.value = '';
-            appendMessageBubble('user', text);
-            searchingIndicator.classList.remove('hidden');
-            sendBtn.disabled = true;
+        documentsList.appendChild(
+            div
+        );
 
-            try {
-                const res = await fetch('/api/query', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+    });
+
+}
+
+
+function escapeHtml(text) {
+
+    const div =
+        document.createElement("div");
+
+    div.textContent = text;
+
+    return div.innerHTML;
+
+}
+
+
+/* ==========================================================
+   CLEAR ALL
+   ========================================================== */
+
+clearAllBtn.onclick =
+async function() {
+
+    if (
+        !confirm(
+            "Delete all documents?"
+        )
+    ) {
+        return;
+    }
+
+    await fetch(
+        "/api/clear",
+        {
+            method: "POST"
+        }
+    );
+
+    fetchDocuments();
+
+    chatMessages.innerHTML = "";
+
+};
+
+
+/* ==========================================================
+   ASK QUESTION
+   ========================================================== */
+
+askBtn.onclick =
+async function() {
+
+    const question =
+        questionInput.value.trim();
+
+    if (!question) {
+        return;
+    }
+
+    welcome.classList.add(
+        "hidden"
+    );
+
+    addMessage(
+        "You",
+        question,
+        true
+    );
+
+    questionInput.value = "";
+
+    askBtn.disabled = true;
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/query",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                        "application/json"
+                    },
+
                     body: JSON.stringify({
-                        query: text,
-                        provider: currentProvider,
-                        api_key: currentApiKey
+
+                        query:
+                        question,
+
+                        provider:
+                        providerSelect.value
+
                     })
-                });
-                const data = await res.json();
-                const answerText = data.answer || data.error || data.message || 'No answer could be retrieved.';
-                appendMessageBubble('assistant', answerText, data.sources || []);
-            } catch (err) {
-                appendMessageBubble('assistant', '⚠️ Error: ' + err.message);
-            } finally {
-                searchingIndicator.classList.add('hidden');
-                sendBtn.disabled = false;
-                chatMessages.scrollTop = chatMessages.scrollHeight;
-            }
-        });
+                }
+            );
 
-        function appendMessageBubble(role, text, sources = []) {
-            const isUser = role === 'user';
-            const msgEl = document.createElement('div');
-            msgEl.className = `flex flex-col ${isUser ? 'items-end' : 'items-start'} text-xs space-y-1`;
+        const data =
+            await response.json();
 
-            let sourcesHtml = '';
-            if (!isUser && sources && sources.length > 0) {
-                const items = sources.map(s => `
-                    <div class="p-2.5 rounded-lg bg-slate-950 border border-slate-800 text-[11px] mt-1 space-y-1">
-                        <div class="font-semibold text-blue-300 flex justify-between">
-                            <span>📄 ${s.filename} (Page ${s.page})</span>
-                            <span class="text-[10px] text-emerald-400">FAISS Score: ${s.score}</span>
-                        </div>
-                        <p class="text-slate-400 italic bg-slate-900/60 p-1.5 rounded">"${s.snippet}"</p>
-                    </div>
-                `).join('');
+        if (!response.ok) {
 
-                sourcesHtml = `
-                    <details class="mt-2.5 pt-2 border-t border-slate-800 w-full text-slate-400">
-                        <summary class="cursor-pointer font-semibold text-blue-400 hover:text-blue-300 text-[11px]">
-                            📚 View ${sources.length} Referenced FAISS Chunks
-                        </summary>
-                        <div class="mt-2 space-y-1.5">${items}</div>
-                    </details>
-                `;
-            }
+            addMessage(
+                "My Documents AI",
+                "Error: "
+                + (
+                    data.error
+                    || "Unknown error"
+                ),
+                false
+            );
 
-            msgEl.innerHTML = `
-                <div class="text-[10px] font-semibold text-slate-400 px-1">${isUser ? 'You' : 'My Documents AI'}</div>
-                <div class="p-4 rounded-2xl max-w-xl ${isUser ? 'bg-blue-600 text-white' : 'bg-slate-900 text-slate-200 border border-slate-800'} markdown-body shadow-md">
-                    ${isUser ? text : marked.parse(text)}
-                    ${sourcesHtml}
-                </div>
-            `;
-
-            chatMessages.appendChild(msgEl);
-            chatMessages.scrollTop = chatMessages.scrollHeight;
+            return;
         }
 
-        fetchDocuments();
-    </script>
+        addMessage(
+            "My Documents AI",
+            data.answer,
+            false
+        );
+
+    } catch (error) {
+
+        addMessage(
+            "My Documents AI",
+            "Error: "
+            + error.message,
+            false
+        );
+
+    } finally {
+
+        askBtn.disabled = false;
+
+    }
+
+};
+
+
+questionInput.addEventListener(
+    "keydown",
+    function(event) {
+
+        if (
+            event.key === "Enter"
+        ) {
+
+            askBtn.click();
+
+        }
+
+    }
+);
+
+
+function addMessage(
+    name,
+    text,
+    user
+) {
+
+    const div =
+        document.createElement("div");
+
+    div.className =
+        user
+        ? "flex justify-end"
+        : "flex justify-start";
+
+    const bubble =
+        document.createElement("div");
+
+    bubble.className =
+        user
+        ? "bg-blue-600 rounded-xl p-4 max-w-xl text-sm"
+        : "bg-slate-950 border border-slate-800 rounded-xl p-4 max-w-xl text-sm";
+
+    const title =
+        document.createElement("div");
+
+    title.className =
+        "text-xs font-bold mb-2";
+
+    title.textContent = name;
+
+    const content =
+        document.createElement("div");
+
+    if (
+        !user &&
+        typeof marked !== "undefined"
+    ) {
+
+        content.innerHTML =
+            marked.parse(text);
+
+    } else {
+
+        content.textContent = text;
+
+    }
+
+    bubble.appendChild(title);
+
+    bubble.appendChild(content);
+
+    div.appendChild(bubble);
+
+    chatMessages.appendChild(div);
+
+    chatMessages.scrollTop =
+        chatMessages.scrollHeight;
+
+}
+
+
+fetchDocuments();
+
+</script>
+
 </body>
+
 </html>
 """
 
 
-@app.route('/')
+# ============================================================
+# FLASK ROUTES
+# ============================================================
+
+@app.route("/")
 def index():
-    return render_template_string(UI_TEMPLATE)
+
+    return render_template_string(
+        HTML
+    )
 
 
-@app.route('/api/upload', methods=['POST'])
+@app.route(
+    "/api/upload",
+    methods=["POST"]
+)
 def api_upload():
-    # Support multiple file input keys ('files', 'file', or direct dict values)
-    files = request.files.getlist('files') or request.files.getlist('file') or list(request.files.values())
-    if not files:
-        return jsonify({'error': 'No file attached'}), 400
 
-    total_chunks = 0
-    uploaded_files_count = 0
+    try:
 
-    for f in files:
-        if not f or not f.filename:
-            continue
-        save_path = os.path.join(app.config['UPLOAD_FOLDER'], f.filename)
-        f.save(save_path)
-        chunks_added = add_document_to_faiss(save_path, f.filename)
-        total_chunks += chunks_added
-        if chunks_added > 0:
-            uploaded_files_count += 1
+        files = request.files.getlist(
+            "files"
+        )
 
-    if total_chunks == 0:
-        return jsonify({
-            'status': 'error',
-            'error': 'No readable text could be extracted from the uploaded document(s). Please ensure files contain text (e.g. standard PDF, DOCX, or TXT).'
-        }), 400
+        if not files:
 
-    return jsonify({
-        'status': 'success',
-        'total_chunks': total_chunks,
-        'uploaded_files': uploaded_files_count,
-        'message': f'Successfully embedded {total_chunks} chunks into FAISS vector database.'
-    })
+            return jsonify(
+                {
+                    "error":
+                    "No file attached."
+                }
+            ), 400
+
+        total_chunks = 0
+
+        for file in files:
+
+            if not file.filename:
+                continue
+
+            filename = os.path.basename(
+                file.filename
+            )
+
+            allowed_extensions = {
+                "pdf",
+                "docx",
+                "txt",
+                "csv",
+                "md"
+            }
+
+            extension = ""
+
+            if "." in filename:
+
+                extension = filename.rsplit(
+                    ".",
+                    1
+                )[-1].lower()
+
+            if extension not in allowed_extensions:
+
+                return jsonify(
+                    {
+                        "error":
+                        "Unsupported file type."
+                    }
+                ), 400
+
+            save_path = os.path.join(
+                UPLOAD_FOLDER,
+                filename
+            )
+
+            file.save(save_path)
+
+            chunks_added = (
+                add_document_to_faiss(
+                    save_path,
+                    filename
+                )
+            )
+
+            total_chunks += chunks_added
+
+        return jsonify(
+            {
+                "status":
+                "success",
+
+                "total_chunks":
+                total_chunks,
+
+                "message":
+                f"Successfully uploaded and indexed "
+                f"{total_chunks} document chunks."
+            }
+        )
+
+    except Exception as e:
+
+        print(
+            "Upload error:",
+            str(e)
+        )
+
+        return jsonify(
+            {
+                "error":
+                str(e)
+            }
+        ), 500
 
 
-@app.route('/api/documents', methods=['GET'])
+@app.route(
+    "/api/documents",
+    methods=["GET"]
+)
 def api_documents():
-    return jsonify({'documents': uploaded_documents})
+
+    return jsonify(
+        {
+            "documents":
+            uploaded_documents
+        }
+    )
 
 
-@app.route('/api/delete', methods=['POST'])
-def api_delete_doc():
-    global faiss_index, chunks_registry, uploaded_documents
-    data = request.get_json() or {}
-    filename = data.get('filename', '').strip()
-    if not filename:
-        return jsonify({'error': 'Filename required'}), 400
+@app.route(
+    "/api/delete",
+    methods=["POST"]
+)
+def api_delete():
 
-    # Filter out chunks and document record
-    chunks_registry = [c for c in chunks_registry if c['filename'] != filename]
-    uploaded_documents = [d for d in uploaded_documents if d['filename'] != filename]
+    global chunks_registry
+    global uploaded_documents
+    global faiss_index
 
-    # Rebuild FAISS index from remaining chunks
-    faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
-    if chunks_registry:
-        texts = [c['text'] for c in chunks_registry]
-        embeddings = embedding_model.encode(texts, normalize_embeddings=True)
-        faiss_index.add(np.array(embeddings, dtype=np.float32))
+    try:
 
-    # Delete physical file
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    if os.path.exists(file_path):
-        try:
+        data = request.get_json() or {}
+
+        filename = (
+            data.get("filename", "")
+            .strip()
+        )
+
+        if not filename:
+
+            return jsonify(
+                {
+                    "error":
+                    "Filename is required."
+                }
+            ), 400
+
+        chunks_registry = [
+            chunk
+            for chunk in chunks_registry
+            if chunk["filename"] != filename
+        ]
+
+        uploaded_documents = [
+            document
+            for document in uploaded_documents
+            if document["filename"] != filename
+        ]
+
+        rebuild_faiss_index()
+
+        save_faiss_index()
+
+        file_path = os.path.join(
+            UPLOAD_FOLDER,
+            filename
+        )
+
+        if os.path.exists(file_path):
+
             os.remove(file_path)
-        except Exception:
-            pass
 
-    save_faiss_index()
-    return jsonify({'status': 'success', 'message': f'Document {filename} removed from index.'})
+        return jsonify(
+            {
+                "status":
+                "success",
+
+                "message":
+                "Document deleted."
+            }
+        )
+
+    except Exception as e:
+
+        print(
+            "Delete error:",
+            str(e)
+        )
+
+        return jsonify(
+            {
+                "error":
+                str(e)
+            }
+        ), 500
 
 
-@app.route('/api/clear', methods=['POST'])
+@app.route(
+    "/api/clear",
+    methods=["POST"]
+)
 def api_clear():
-    global faiss_index, chunks_registry, uploaded_documents
+
+    global chunks_registry
+    global uploaded_documents
+    global faiss_index
+
     chunks_registry = []
+
     uploaded_documents = []
-    faiss_index = faiss.IndexFlatL2(EMBEDDING_DIM)
 
-    if os.path.exists(app.config['INDEX_FOLDER']):
-        shutil.rmtree(app.config['INDEX_FOLDER'])
-    os.makedirs(app.config['INDEX_FOLDER'], exist_ok=True)
+    faiss_index = create_empty_index()
 
-    if os.path.exists(app.config['UPLOAD_FOLDER']):
-        shutil.rmtree(app.config['UPLOAD_FOLDER'])
-    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+    try:
 
-    save_faiss_index()
-    return jsonify({'status': 'success', 'message': 'All documents and FAISS index cleared.'})
+        if os.path.exists(
+            INDEX_FOLDER
+        ):
+
+            shutil.rmtree(
+                INDEX_FOLDER
+            )
+
+        os.makedirs(
+            INDEX_FOLDER,
+            exist_ok=True
+        )
+
+        if os.path.exists(
+            UPLOAD_FOLDER
+        ):
+
+            shutil.rmtree(
+                UPLOAD_FOLDER
+            )
+
+        os.makedirs(
+            UPLOAD_FOLDER,
+            exist_ok=True
+        )
+
+        save_faiss_index()
+
+    except Exception as e:
+
+        print(
+            "Clear error:",
+            str(e)
+        )
+
+        return jsonify(
+            {
+                "error":
+                str(e)
+            }
+        ), 500
+
+    return jsonify(
+        {
+            "status":
+            "success",
+
+            "message":
+            "All documents cleared."
+        }
+    )
 
 
-@app.route('/api/query', methods=['POST'])
+@app.route(
+    "/api/query",
+    methods=["POST"]
+)
 def api_query():
-    data = request.get_json() or {}
-    query_text = data.get('query', '').strip()
-    provider = data.get('provider', 'gemini')
-    api_key = data.get('api_key', None)
 
-    if not query_text:
-        return jsonify({'error': 'Question cannot be empty'}), 400
+    try:
 
-    # 1. Search FAISS
-    retrieved_chunks = search_faiss(query_text, top_k=3)
-    if not retrieved_chunks:
-        return jsonify({
-            'answer': 'No documents found in your knowledge base. Please upload at least one document first.',
-            'sources': []
-        })
+        data = request.get_json() or {}
 
-    # 2. Build Context String
-    context_parts = []
-    for c in retrieved_chunks:
-        context_parts.append(f"[Document: {c['filename']}, Page: {c['page']}]\n{c['text']}")
-    context_str = "\n\n".join(context_parts)
+        question = (
+            data.get("query", "")
+            .strip()
+        )
 
-    # 3. Call LLM
-    answer = call_llm(query_text, context_str, provider=provider, api_key=api_key)
+        provider = (
+            data.get(
+                "provider",
+                "gemini"
+            )
+            or "gemini"
+        )
 
-    # 4. Pure Python Fallback Answer if LLM API is unavailable / offline
-    if not answer:
-        answer = f"Based on your documents, here are the most relevant findings for **\"{query_text}\"**:\n\n"
-        for c in retrieved_chunks:
-            answer += f"- **From {c['filename']} (Page {c['page']}):**\n  > \"{c['text']}\"\n\n"
-        answer += "\n---\n💡 *Configure a Google Gemini API Key or run Ollama to synthesize natural conversational responses.*"
+        if not question:
 
-    return jsonify({
-        'answer': answer,
-        'sources': retrieved_chunks
-    })
+            return jsonify(
+                {
+                    "error":
+                    "Question cannot be empty."
+                }
+            ), 400
+
+        if not chunks_registry:
+
+            return jsonify(
+                {
+                    "answer":
+                    "Please upload a document first.",
+
+                    "sources":
+                    []
+                }
+            )
+
+        retrieved_chunks = search_faiss(
+            question,
+            top_k=3
+        )
+
+        if not retrieved_chunks:
+
+            return jsonify(
+                {
+                    "answer":
+                    "No relevant information was found "
+                    "in the uploaded documents.",
+
+                    "sources":
+                    []
+                }
+            )
+
+        context_parts = []
+
+        for chunk in retrieved_chunks:
+
+            context_parts.append(
+                "[Document: "
+                + chunk["filename"]
+                + ", Page: "
+                + str(chunk["page"])
+                + "]\n"
+                + chunk["text"]
+            )
+
+        context = "\n\n".join(
+            context_parts
+        )
+
+        answer = call_llm(
+            question,
+            context,
+            provider=provider
+        )
+
+        if not answer:
+
+            answer = (
+                "I found these relevant sections "
+                "in your documents:\n\n"
+            )
+
+            for chunk in retrieved_chunks:
+
+                answer += (
+                    "**"
+                    + chunk["filename"]
+                    + " - Page "
+                    + str(chunk["page"])
+                    + "**\n\n"
+                    + chunk["text"]
+                    + "\n\n"
+                )
+
+        return jsonify(
+            {
+                "answer":
+                answer,
+
+                "sources":
+                retrieved_chunks
+            }
+        )
+
+    except Exception as e:
+
+        print(
+            "Query error:",
+            str(e)
+        )
+
+        return jsonify(
+            {
+                "error":
+                str(e)
+            }
+        ), 500
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    print("\n" + "="*70)
-    print(">> 'My Documents' Simple RAG Application is running!")
-    print(f">> Open in browser: http://0.0.0.0:{port}")
-    print("="*70 + "\n")
-    app.run(host='0.0.0.0', port=port, debug=False)
+# ============================================================
+# START APPLICATION
+# ============================================================
+
+if __name__ == "__main__":
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
+
+    print(
+        "My Documents AI is running..."
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False
+    )
