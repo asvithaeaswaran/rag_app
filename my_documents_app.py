@@ -537,7 +537,7 @@ def search_faiss(
 def call_llm(
     user_question: str,
     context_text: str,
-    provider: str = "openai",
+    provider: str = "gemini",
     api_key: str = None
 ) -> str:
 
@@ -1849,7 +1849,7 @@ def api_query():
     answer = call_llm(
         query_text,
         context_str,
-        provider="openai"
+        provider="gemini"
     )
 
 
