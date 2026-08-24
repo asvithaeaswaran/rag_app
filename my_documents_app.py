@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 import pypdf
 import docx
 import faiss
-from sentence_transformers import SentenceTransformer
 import requests
 
 # Load .env variables
