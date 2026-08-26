@@ -1,6 +1,7 @@
 @"
 .env
 venv/
+
 __pycache__/
 *.pyc
 my_documents_faiss/
