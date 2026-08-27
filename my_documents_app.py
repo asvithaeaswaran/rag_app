@@ -943,11 +943,7 @@ def api_query():
 
     # 4. Fallback Answer if LLM API is unavailable / offline
     if not answer:
-        answer = f"Based on your documents, here are the most relevant findings for **\"{query_text}\"**:\n\n"
-        for c in retrieved_chunks:
-            answer += f"- **From {c['filename']} (Page {c['page']}):**\n  > \"{c['text']}\"\n\n"
-        answer += "\n---\n💡 *Tip: Add your Google Gemini API Key in Settings to get conversational AI synthesis.*"
-
+             answer = "I couldn't generate a focused answer. Please check your Gemini API key and try again."
     return jsonify({
         'answer': answer,
         'sources': retrieved_chunks
