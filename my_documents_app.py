@@ -1,8 +1,9 @@
 def search_similar_chunks(
     query,
-    top_k=TOP_K,
+    top_k=3,
     api_key=None,
     min_score=0.25
+
 ):
     """
     Retrieve relevant document chunks using cosine similarity.
