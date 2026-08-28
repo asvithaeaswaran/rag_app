@@ -158,18 +158,21 @@ def sanitize_key(val):
 
 
 def get_gemini_embedding(text: str, api_key: str) -> list[float]:
-    """Fetch 100% free embeddings from Google Gemini API (text-embedding-004)."""
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={api_key}"
-        payload = {
-            "model": "models/text-embedding-004",
-            "content": {"parts": [{"text": text[:2000]}]}
-        }
-        res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
-        if res.status_code == 200:
-            return res.json()['embedding']['values']
-    except Exception as e:
-        print(f"Gemini embedding API warning: {e}")
+    """Fetch 100% free embeddings from Google Gemini API."""
+    for model_name in ['gemini-embedding-001', 'gemini-embedding-2', 'text-embedding-004']:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:embedContent?key={api_key}"
+            payload = {
+                "model": f"models/{model_name}",
+                "content": {"parts": [{"text": text[:2000]}]}
+            }
+            res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
+            if res.status_code == 200:
+                data = res.json()
+                if 'embedding' in data and 'values' in data['embedding']:
+                    return data['embedding']['values']
+        except Exception as e:
+            continue
     return None
 
 
@@ -320,7 +323,15 @@ def search_similar_chunks(query: str, top_k: int = 5, api_key: str = None) -> li
         return []
 
     # If total chunks are small (<= 8 chunks), return all chunks so LLM has full context
-    
+    if len(chunks_registry) <= 8:
+        return [{
+            'rank': idx + 1,
+            'filename': c['filename'],
+            'page': c['page'],
+            'text': c['text'],
+            'score': 1.0,
+            'snippet': c['text'][:250] + ('...' if len(c['text']) > 250 else '')
+        } for idx, c in enumerate(chunks_registry)]
 
     gemini_key = sanitize_key(api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
     scores = np.zeros(len(chunks_registry), dtype=np.float32)
@@ -368,46 +379,43 @@ def search_similar_chunks(query: str, top_k: int = 5, api_key: str = None) -> li
 def call_llm(user_question: str, context_text: str, provider: str = "auto", api_key: str = None) -> str:
     """Direct HTTP requests to LLM APIs (Gemini 2.0 Flash / Groq / OpenAI)."""
     system_instruction = (
-    "You are 'My Documents AI', a document question-answering assistant. "
-    "Answer ONLY the specific question asked by the user using the provided document excerpts.\n\n"
-    "Rules:\n"
-    "1. Answer only the user's specific question.\n"
-    "2. Use only information relevant to the question.\n"
-    "3. Do not provide unrelated information from the document.\n"
-    "4. Do not summarize the whole document unless the user explicitly asks for a summary.\n"
-    "5. If the question asks for a list, provide only the relevant list.\n"
-    "6. Keep the answer concise and focused.\n"
-    "7. Do not repeat the document excerpts.\n"
-    "8. Do not add information that is not supported by the document.\n"
-    "9. If the answer is not found in the provided excerpts, say that the information was not found."
-)
+        "You are 'My Documents AI', an expert and helpful document intelligence assistant. "
+        "Your task is to thoroughly and accurately answer the user's question using the provided document excerpts.\n\n"
+        "Guidelines:\n"
+        "1. Read all the document excerpts carefully.\n"
+        "2. Directly answer the question using the facts, numbers, dates, and explanations present in the text.\n"
+        "3. Provide specific details, bullet points, or step-by-step breakdowns.\n"
+        "4. If the user asks for a summary or overview, synthesize the main topics clearly.\n"
+        "5. If relevant information is mentioned in the excerpts, explain what the document states.\n"
+        "6. Only state that the information was not found if the excerpts are completely unrelated to the question."
+    )
 
     full_prompt = (
-    f"DOCUMENT EXCERPTS:\n{context_text}\n\n"
-    f"USER QUESTION: {user_question}\n\n"
-    "Answer ONLY the user's question. "
-    "Return only information directly relevant to the question."
-)
+        f"DOCUMENT EXCERPTS:\n{context_text}\n\n"
+        f"USER QUESTION: {user_question}\n\n"
+        "Please provide a comprehensive and clear answer based on the document excerpts above."
+    )
 
     cleaned_user_key = sanitize_key(api_key)
     gemini_key = sanitize_key(cleaned_user_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
     groq_openai_key = sanitize_key(cleaned_user_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("GROQ_API_KEY"))
 
     # A) Google Gemini Direct API (Free Tier)
-    if (provider == "gemini" or (not provider and gemini_key and gemini_key.startswith("AIza"))) and gemini_key:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}"
-            payload = {
-                "contents": [{"parts": [{"text": f"System: {system_instruction}\n\n{full_prompt}"}]}],
-                "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
-            }
-            res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=25)
-            if res.status_code == 200:
-                data = res.json()
-                if 'candidates' in data and data['candidates']:
-                    return data['candidates'][0]['content']['parts'][0]['text']
-        except Exception as e:
-            print(f"Gemini API exception: {e}")
+    if (provider == "gemini" or (not provider and gemini_key and (gemini_key.startswith("AIza") or gemini_key.startswith("AQ.")))) and gemini_key:
+        for model_name in ['gemini-3.6-flash', 'gemini-3.7-flash', 'gemini-flash-latest', 'gemini-2.5-flash-lite', 'gemini-2.0-flash']:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_key}"
+                payload = {
+                    "contents": [{"parts": [{"text": f"System: {system_instruction}\n\n{full_prompt}"}]}],
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048}
+                }
+                res = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=25)
+                if res.status_code == 200:
+                    data = res.json()
+                    if 'candidates' in data and data['candidates']:
+                        return data['candidates'][0]['content']['parts'][0]['text']
+            except Exception as e:
+                continue
 
     # B) Groq / OpenAI Direct API
     if groq_openai_key:
@@ -925,7 +933,7 @@ def api_query():
         return jsonify({'error': 'Question cannot be empty'}), 400
 
     # 1. Search hybrid vector & keyword similarity
-    retrieved_chunks = search_similar_chunks(query_text, top_k=3, api_key=api_key)
+    retrieved_chunks = search_similar_chunks(query_text, top_k=5, api_key=api_key)
     if not retrieved_chunks:
         return jsonify({
             'answer': 'No documents found in your knowledge base. Please upload at least one document first.',
@@ -943,7 +951,11 @@ def api_query():
 
     # 4. Fallback Answer if LLM API is unavailable / offline
     if not answer:
-             answer = "I couldn't generate a focused answer. Please check your Gemini API key and try again."
+        answer = f"Based on your documents, here are the most relevant findings for **\"{query_text}\"**:\n\n"
+        for c in retrieved_chunks:
+            answer += f"- **From {c['filename']} (Page {c['page']}):**\n  > \"{c['text']}\"\n\n"
+        answer += "\n---\n💡 *Tip: Add your Google Gemini API Key in Settings to get conversational AI synthesis.*"
+
     return jsonify({
         'answer': answer,
         'sources': retrieved_chunks
